@@ -8,9 +8,14 @@ Run with: streamlit run park_tiff_viewer.py
 Author: NanosparQ Training
 """
 
+import io
+import os
+
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import streamlit as st
+from streamlit_image_select import image_select
 
 # Import core logic from separate module
 from park_tiff_core import (
@@ -19,9 +24,11 @@ from park_tiff_core import (
     KNOWN_CHANNELS,
     apply_background_subtraction,
     check_file_complete,
+    copy_to_clipboard,
     export_to_powerpoint,
     extract_tiff_metadata,
     filter_files,
+    find_gwyddion_executable,
     get_all_channels_for_frame,
     get_colormap_for_channel,
     get_display_range,
@@ -31,6 +38,7 @@ from park_tiff_core import (
     get_tiff_files,
     get_unique_values,
     load_tiff,
+    open_in_gwyddion,
 )
 
 
@@ -38,15 +46,176 @@ from park_tiff_core import (
 # Streamlit-specific wrappers with caching
 # ============================================================
 @st.cache_data
-def cached_load_tiff(filepath):
-    """Cached wrapper for load_tiff."""
-    return load_tiff(filepath)
-
-
-@st.cache_data
 def cached_check_file_complete(filepath, threshold_ratio=0.1):
     """Cached wrapper for check_file_complete."""
     return check_file_complete(filepath, threshold_ratio)
+
+
+@st.cache_data
+def cached_load_and_process(filepath, bg_method, degree, cutoff_fraction):
+    """
+    Load a TIFF and apply background subtraction, cached on every input
+    that affects the result. Background subtraction (poly fits, Fourier
+    filtering) is the expensive step, and without this it gets redone for
+    every visible thumbnail on *every* rerun, since Streamlit re-executes
+    all tabs/expanders (not just the visible one) each interaction.
+    """
+    data = load_tiff(filepath)
+    if data is None:
+        return None
+    if bg_method != "None":
+        data = apply_background_subtraction(
+            data, bg_method, degree=degree, cutoff_fraction=cutoff_fraction
+        )
+    return data
+
+
+@st.cache_data
+def render_thumbnail_png(
+    filepath, bg_method, degree, cutoff_fraction, cmap, vmin, vmax, figsize=(2.5, 2.5)
+):
+    """
+    Render a small gallery thumbnail to PNG bytes, cached on everything
+    that affects its appearance. Repeated reruns (e.g. after clicking a
+    different thumbnail) hit this cache instead of re-running matplotlib
+    for every cell in the grid.
+    """
+    data = cached_load_and_process(filepath, bg_method, degree, cutoff_fraction)
+    if data is None:
+        return None
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
+    ax.axis("off")
+    plt.tight_layout(pad=0.3)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100)
+    plt.close(fig)
+    return buf.getvalue()
+
+
+@st.cache_data
+def render_thumbnail_array(filepath, bg_method, degree, cutoff_fraction, cmap, vmin, vmax):
+    """
+    Map data straight to an RGB uint8 array via the colormap, skipping
+    matplotlib's Figure/Axes machinery entirely. Cheaper than rendering a
+    full pyplot figure per thumbnail, and it's the format image_select
+    (used for click-to-select gallery thumbnails) expects.
+    """
+    data = cached_load_and_process(filepath, bg_method, degree, cutoff_fraction)
+    if data is None:
+        return None
+    norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax, clip=True)
+    rgba = mpl.colormaps[cmap](norm(data))
+    return (rgba[..., :3] * 255).astype(np.uint8)
+
+
+# ============================================================
+# Gallery <-> Single File tab sync
+# ============================================================
+def file_label(idx, file_info):
+    """Dropdown label for the file at a given index in filtered_files."""
+    return f"{idx + 1}. {file_info['full_name']}"
+
+
+def select_file_from_gallery(file_info, filtered_files):
+    """
+    Point the Single File tab at this file and copy its path to the
+    clipboard. Safe to call either from a plain st.button on_click, or
+    (as with the image_select gallery rows) from regular top-of-script
+    code that runs before Tab1 renders — either way no st.rerun() is
+    needed here, since the caller controls when/whether one happens.
+    """
+    idx = next(
+        (i for i, f in enumerate(filtered_files) if f["path"] == file_info["path"]),
+        None,
+    )
+    if idx is not None:
+        st.session_state.file_idx = idx
+        st.session_state._force_nav_sync = True
+
+    ok, msg = copy_to_clipboard(file_info["path"])
+    channel = file_info.get("channel") or "Data"
+    name = os.path.basename(file_info["path"])
+    st.toast(f"📋 Copied path — {channel} ({name})" if ok else f"⚠️ {msg}")
+
+
+def build_gallery_lookup(filtered_files, frames_info):
+    """(seen_channels, {(frame_key, channel): file_info}) for the gallery."""
+    seen_channels = []
+    for f in filtered_files:
+        ch = f.get("channel") or "Data"
+        if ch not in seen_channels:
+            seen_channels.append(ch)
+
+    lookup = {}
+    for f in filtered_files:
+        fkey = (f["experiment"], f["frame"])
+        ch = f.get("channel") or "Data"
+        if fkey in frames_info and (fkey, ch) not in lookup:
+            lookup[(fkey, ch)] = f
+
+    return seen_channels, lookup
+
+
+def build_gallery_rows(
+    seen_channels,
+    gallery_lookup,
+    frame_keys,
+    get_bg_method_for_channel,
+    poly_degree,
+    fourier_cutoff,
+    limit=6,
+):
+    """
+    Ordered (frame_key, [(channel, file_info), ...]) rows for the Quick
+    Gallery, filtered to files with loadable data. This exact ordering is
+    what image_select's returned index refers to, so it must be computed
+    identically whether it's used to peek for a pending click (before
+    Tab1 renders) or for the actual later render — same function, called
+    twice, guarantees that.
+    """
+    rows = []
+    for fk in frame_keys[:limit]:
+        entries = []
+        for ch in seen_channels:
+            file_info = gallery_lookup.get((fk, ch))
+            if file_info is None:
+                continue
+            bg_method = get_bg_method_for_channel(ch)
+            data = cached_load_and_process(
+                file_info["path"], bg_method, poly_degree, fourier_cutoff
+            )
+            if data is None:
+                continue
+            entries.append((ch, file_info))
+        if entries:
+            rows.append((fk, entries))
+    return rows
+
+
+def sync_gallery_clicks(gallery_rows, filtered_files):
+    """
+    Peek at each gallery row's image_select value *before* it's actually
+    rendered again further down the page, and apply a pending click right
+    away. Streamlit already has a keyed widget's latest value in
+    session_state at the start of a rerun, before the script reaches the
+    line that re-creates that widget — so this lets a gallery click take
+    effect in the same rerun Tab1 uses, instead of needing a second,
+    visibly-flashing st.rerun() after Quick Gallery finishes rendering.
+    """
+    for fk, entries in gallery_rows:
+        row_key = f"gallery_row_{fk[0]}_{fk[1]}"
+        prev_key = f"_{row_key}_prev"
+        clicked_idx = st.session_state.get(row_key)
+        prev_idx = st.session_state.get(prev_key, 0)
+        if (
+            clicked_idx is not None
+            and clicked_idx != prev_idx
+            and clicked_idx < len(entries)
+        ):
+            st.session_state[prev_key] = clicked_idx
+            _, clicked_file = entries[clicked_idx]
+            select_file_from_gallery(clicked_file, filtered_files)
 
 
 # ============================================================
@@ -167,6 +336,14 @@ def main():
         return
 
     st.sidebar.info(f"Showing {len(filtered_files)} of {len(files)} files")
+
+    # Canonical "currently selected file" index, shared by every nav mode
+    # in the Single File tab and settable from the gallery views below.
+    if "file_idx" not in st.session_state:
+        st.session_state.file_idx = 0
+    st.session_state.file_idx = max(
+        0, min(st.session_state.file_idx, len(filtered_files) - 1)
+    )
 
     # ---- Sidebar: Display Options ----
     st.sidebar.header("🎨 Display Options")
@@ -340,12 +517,47 @@ def main():
             return st.session_state.bg_settings.get(channel, default_bg_method)
         return default_bg_method
 
-    # Helper function to apply background subtraction
-    def apply_bg_for_channel(data, channel):
-        method = get_bg_method_for_channel(channel)
-        return apply_background_subtraction(
-            data, method, degree=poly_degree, cutoff_fraction=fourier_cutoff
+    # ---- Sidebar: External Tools ----
+    st.sidebar.header("🔬 External Tools")
+
+    if "gwyddion_path" not in st.session_state:
+        st.session_state.gwyddion_path = find_gwyddion_executable() or ""
+
+    with st.sidebar.expander(
+        "Gwyddion path",
+        expanded=not st.session_state.gwyddion_path,
+    ):
+        st.session_state.gwyddion_path = st.text_input(
+            "Executable / app path",
+            value=st.session_state.gwyddion_path,
+            help="Path to the Gwyddion executable (Windows/Linux) or "
+            "Gwyddion.app (macOS). Auto-detected if left as found.",
+            label_visibility="collapsed",
         )
+        if st.session_state.gwyddion_path:
+            st.caption(f"✅ {st.session_state.gwyddion_path}")
+        else:
+            st.caption("⚠️ Gwyddion not found — set the path manually")
+
+    # ---- Early gallery-click detection (must run before Tab1) ----
+    # The Quick Gallery itself is rendered far below (after all 4 tabs),
+    # but a click there needs to affect Tab1's selection in the *same*
+    # rerun. Computing the rows and checking for a pending click here,
+    # before Tab1 exists, makes that possible with zero extra reruns.
+    frames_info_gallery = get_frames_info(filtered_files)
+    frame_keys_gallery = sorted(frames_info_gallery.keys())
+    seen_channels_gallery, gallery_lookup = build_gallery_lookup(
+        filtered_files, frames_info_gallery
+    )
+    gallery_rows = build_gallery_rows(
+        seen_channels_gallery,
+        gallery_lookup,
+        frame_keys_gallery,
+        get_bg_method_for_channel,
+        poly_degree,
+        fourier_cutoff,
+    )
+    sync_gallery_clicks(gallery_rows, filtered_files)
 
     # ---- Main Tabs ----
     tab1, tab2, tab3, tab4 = st.tabs(
@@ -363,8 +575,9 @@ def main():
 
             # Create display names for dropdown
             file_options = {
-                f"{i + 1}. {f['full_name']}": i for i, f in enumerate(filtered_files)
+                file_label(i, f): i for i, f in enumerate(filtered_files)
             }
+            file_names = list(file_options.keys())
 
             # Navigation mode
             nav_mode = st.radio(
@@ -374,24 +587,47 @@ def main():
                 key="nav_mode_single",
             )
 
+            # If a gallery click just happened, force the *active* nav
+            # widget's stored state to match st.session_state.file_idx
+            # before it's instantiated below (must happen pre-creation).
+            if st.session_state.pop("_force_nav_sync", False):
+                if nav_mode == "Dropdown":
+                    st.session_state["dropdown_select_idx"] = file_label(
+                        st.session_state.file_idx,
+                        filtered_files[st.session_state.file_idx],
+                    )
+                elif nav_mode == "Slider":
+                    st.session_state["slider_select_idx"] = st.session_state.file_idx
+
             if nav_mode == "Dropdown":
+                # Guard against a stale selection left over from before a
+                # filter change removed that file from the options list.
+                if st.session_state.get("dropdown_select_idx") not in file_names:
+                    st.session_state["dropdown_select_idx"] = file_names[
+                        min(st.session_state.file_idx, len(file_names) - 1)
+                    ]
                 selected_name = st.selectbox(
-                    "Select file", options=list(file_options.keys()), index=0
+                    "Select file", options=file_names, key="dropdown_select_idx"
                 )
                 selected_idx = file_options[selected_name]
 
             elif nav_mode == "Slider":
+                max_idx = len(filtered_files) - 1
+                if (
+                    "slider_select_idx" not in st.session_state
+                    or st.session_state["slider_select_idx"] > max_idx
+                ):
+                    st.session_state["slider_select_idx"] = min(
+                        st.session_state.file_idx, max_idx
+                    )
                 selected_idx = st.slider(
                     "File index",
                     min_value=0,
-                    max_value=len(filtered_files) - 1,
-                    value=0,
+                    max_value=max_idx,
+                    key="slider_select_idx",
                 )
 
             else:  # Prev/Next
-                if "file_idx" not in st.session_state:
-                    st.session_state.file_idx = 0
-
                 col_prev, col_next = st.columns(2)
                 with col_prev:
                     if st.button(
@@ -408,6 +644,11 @@ def main():
 
                 selected_idx = st.session_state.file_idx
                 st.write(f"File {selected_idx + 1} of {len(filtered_files)}")
+
+            # Keep the canonical index in sync with whichever widget the
+            # user actually just used, so switching nav modes or clicking
+            # a gallery thumbnail next always starts from the right place.
+            st.session_state.file_idx = selected_idx
 
             # Get selected file
             selected_file = filtered_files[selected_idx]
@@ -434,6 +675,24 @@ def main():
                 st.success(f"✅ Complete ({completion_pct:.0f}%)")
             else:
                 st.error(f"⚠️ Incomplete ({completion_pct:.0f}%)")
+
+            # Open in Gwyddion
+            if st.button(
+                "🔬 Open in Gwyddion",
+                use_container_width=True,
+                key="open_gwyddion_single",
+                disabled=not st.session_state.gwyddion_path,
+                help="Launch this file in Gwyddion"
+                if st.session_state.gwyddion_path
+                else "Set the Gwyddion path in the sidebar first",
+            ):
+                ok, msg = open_in_gwyddion(
+                    selected_file["path"], st.session_state.gwyddion_path
+                )
+                if ok:
+                    st.toast(msg, icon="🔬")
+                else:
+                    st.error(msg)
 
             # TIFF Metadata (if enabled)
             if show_metadata:
@@ -464,16 +723,13 @@ def main():
             st.subheader("🖼️ Image Preview")
 
             # Load and display image
-            data = cached_load_tiff(selected_file["path"])
+            bg_method = get_bg_method_for_channel(selected_file["channel"])
+            data = cached_load_and_process(
+                selected_file["path"], bg_method, poly_degree, fourier_cutoff
+            )
 
             if data is not None:
-                # Work with a copy to avoid modifying cached data
-                data = data.copy()
-
-                # Apply background subtraction
-                bg_method = get_bg_method_for_channel(selected_file["channel"])
                 if bg_method != "None":
-                    data = apply_bg_for_channel(data, selected_file["channel"])
                     st.caption(f"🔧 Background: {bg_method}")
 
                 # Show data statistics
@@ -579,16 +835,11 @@ def main():
                         if file_idx < n_channels:
                             f = frame_channels[file_idx]
                             with cols[col_idx]:
-                                data = cached_load_tiff(f["path"])
+                                bg_method = get_bg_method_for_channel(f["channel"])
+                                data = cached_load_and_process(
+                                    f["path"], bg_method, poly_degree, fourier_cutoff
+                                )
                                 if data is not None:
-                                    # Work with a copy to avoid modifying cached data
-                                    data = data.copy()
-
-                                    # Apply background subtraction
-                                    bg_method = get_bg_method_for_channel(f["channel"])
-                                    if bg_method != "None":
-                                        data = apply_bg_for_channel(data, f["channel"])
-
                                     # Check completeness
                                     is_complete, pct = cached_check_file_complete(
                                         f["path"]
@@ -904,16 +1155,14 @@ def main():
                         if file_info is None:
                             st.caption("—")
                             continue
-                        data = cached_load_tiff(file_info["path"])
+
+                        bg_method = get_bg_method_for_channel(ch)
+                        data = cached_load_and_process(
+                            file_info["path"], bg_method, poly_degree, fourier_cutoff
+                        )
                         if data is None:
                             st.caption("no data")
                             continue
-                        data = data.copy()
-
-                        # Apply background subtraction
-                        bg_method = get_bg_method_for_channel(ch)
-                        if bg_method != "None":
-                            data = apply_bg_for_channel(data, ch)
 
                         # Choose colormap
                         if auto_colormap and ch:
@@ -924,83 +1173,74 @@ def main():
                         # Get color scale limits
                         vmin, vmax = get_adjusted_display_range(data)
 
-                        fig, ax = plt.subplots(figsize=(2.5, 2.5))
-                        ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
-                        ax.axis("off")
-                        plt.tight_layout(pad=0.3)
-                        st.pyplot(fig)
-                        plt.close(fig)
+                        png = render_thumbnail_png(
+                            file_info["path"],
+                            bg_method,
+                            poly_degree,
+                            fourier_cutoff,
+                            cmap,
+                            float(vmin),
+                            float(vmax),
+                        )
+                        if png:
+                            st.image(png, use_container_width=True)
 
     # ---- Bottom: Quick Gallery ----
     st.markdown("---")
     with st.expander("📸 Quick Gallery", expanded=False):
-        # Build grid: rows = frames, columns = channels
-        frames_info_gallery = get_frames_info(filtered_files)
-        frame_keys = sorted(frames_info_gallery.keys())
+        st.caption(
+            "Click a thumbnail to show it in the Single File tab and copy "
+            "its path to the clipboard. ✅ marks the one currently shown there."
+        )
 
-        if not frame_keys:
+        if not gallery_rows:
             st.info("No frames available for gallery.")
         else:
-            # Collect unique channels preserving order of appearance
-            seen_channels = []
-            for f in filtered_files:
-                ch = f.get("channel") or "Data"
-                if ch not in seen_channels:
-                    seen_channels.append(ch)
+            current_path = filtered_files[st.session_state.file_idx]["path"]
 
-            # Build a lookup: (frame_key, channel) -> file info
-            gallery_lookup = {}
-            for f in filtered_files:
-                fkey = (f["experiment"], f["frame"])
-                ch = f.get("channel") or "Data"
-                if fkey in frames_info_gallery and (fkey, ch) not in gallery_lookup:
-                    gallery_lookup[(fkey, ch)] = f
+            # One clickable image_select row per frame. Any click was
+            # already applied above (before Tab1 rendered) — this just
+            # displays the current state, it doesn't need to detect
+            # changes or rerun itself.
+            for fk, entries in gallery_rows:
+                st.markdown(f"**Frame {fk[1]:03d}** — _{fk[0]}_")
 
-            # Header row with channel labels
-            header_cols = st.columns([0.8] + [1] * len(seen_channels))
-            with header_cols[0]:
-                st.markdown("**Frame**")
-            for j, ch in enumerate(seen_channels):
-                with header_cols[j + 1]:
-                    st.markdown(f"**{ch}**")
+                images = []
+                captions = []
+                for ch, file_info in entries:
+                    bg_method = get_bg_method_for_channel(ch)
+                    data = cached_load_and_process(
+                        file_info["path"], bg_method, poly_degree, fourier_cutoff
+                    )
+                    cmap = (
+                        get_colormap_for_channel(ch)
+                        if auto_colormap and ch
+                        else colormap
+                    )
+                    vmin, vmax = get_adjusted_display_range(data)
+                    images.append(
+                        render_thumbnail_array(
+                            file_info["path"],
+                            bg_method,
+                            poly_degree,
+                            fourier_cutoff,
+                            cmap,
+                            float(vmin),
+                            float(vmax),
+                        )
+                    )
+                    captions.append(f"{ch} ✅" if file_info["path"] == current_path else ch)
 
-            # One row per frame (limit to first 6)
-            for fk in frame_keys[:6]:
-                row_cols = st.columns([0.8] + [1] * len(seen_channels))
-                with row_cols[0]:
-                    st.markdown(f"_Frame {fk[1]:03d}_")
-                for j, ch in enumerate(seen_channels):
-                    with row_cols[j + 1]:
-                        file_info = gallery_lookup.get((fk, ch))
-                        if file_info is None:
-                            st.caption("—")
-                            continue
-                        data = cached_load_tiff(file_info["path"])
-                        if data is None:
-                            st.caption("no data")
-                            continue
-                        data = data.copy()
-
-                        # Apply background subtraction
-                        bg_method = get_bg_method_for_channel(ch)
-                        if bg_method != "None":
-                            data = apply_bg_for_channel(data, ch)
-
-                        # Choose colormap
-                        if auto_colormap and ch:
-                            cmap = get_colormap_for_channel(ch)
-                        else:
-                            cmap = colormap
-
-                        # Get color scale limits
-                        vmin, vmax = get_adjusted_display_range(data)
-
-                        fig, ax = plt.subplots(figsize=(2.5, 2.5))
-                        ax.imshow(data, cmap=cmap, vmin=vmin, vmax=vmax, aspect="auto")
-                        ax.axis("off")
-                        plt.tight_layout(pad=0.3)
-                        st.pyplot(fig)
-                        plt.close(fig)
+                row_key = f"gallery_row_{fk[0]}_{fk[1]}"
+                prev_key = f"_{row_key}_prev"
+                image_select(
+                    "",
+                    images=images,
+                    captions=captions,
+                    index=st.session_state.get(prev_key, 0),
+                    return_value="index",
+                    key=row_key,
+                )
 
 
 if __name__ == "__main__":

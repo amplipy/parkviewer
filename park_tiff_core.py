@@ -8,7 +8,11 @@ This module contains all data processing logic, independent of any UI framework.
 
 import numpy as np
 from pathlib import Path
+import os
 import re
+import platform
+import shutil
+import subprocess
 from PIL import Image
 
 
@@ -1123,3 +1127,103 @@ def export_to_powerpoint(files, output_path, scan_size_um=None,
         
     except Exception as e:
         return False, f"Export failed: {str(e)}", 0
+
+
+# ============================================================
+# External Tool Integration
+# ============================================================
+# Common install locations to check before falling back to PATH lookup.
+_GWYDDION_CANDIDATES = {
+    "Darwin": ["/Applications/Gwyddion.app"],
+    "Windows": [
+        r"C:\Program Files (x86)\Gwyddion\bin\gwyddion.exe",
+        r"C:\Program Files\Gwyddion\bin\gwyddion.exe",
+    ],
+    "Linux": ["/usr/bin/gwyddion", "/usr/local/bin/gwyddion"],
+}
+
+
+def find_gwyddion_executable():
+    """
+    Try to locate a Gwyddion install for the current OS.
+
+    Returns the path to the executable (or, on macOS, the .app bundle),
+    or None if it could not be found automatically.
+    """
+    system = platform.system()
+
+    for candidate in _GWYDDION_CANDIDATES.get(system, []):
+        if os.path.exists(candidate):
+            return candidate
+
+    on_path = shutil.which("gwyddion")
+    if on_path:
+        return on_path
+
+    return None
+
+
+def copy_to_clipboard(text):
+    """
+    Copy text to the system clipboard using OS-native command-line tools
+    (no extra Python dependency). Only meaningful when the Streamlit
+    server runs on the same machine as the user, i.e. local use.
+
+    Returns:
+        (success, message) tuple.
+    """
+    system = platform.system()
+    try:
+        if system == "Darwin":
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+        elif system == "Windows":
+            subprocess.run(["clip"], input=text.encode("utf-8"), check=True)
+        else:
+            try:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text.encode("utf-8"),
+                    check=True,
+                )
+            except (FileNotFoundError, subprocess.CalledProcessError):
+                subprocess.run(
+                    ["xsel", "--clipboard", "--input"],
+                    input=text.encode("utf-8"),
+                    check=True,
+                )
+        return True, "Copied to clipboard"
+    except (OSError, subprocess.CalledProcessError) as e:
+        return False, f"Could not copy to clipboard: {e}"
+
+
+def open_in_gwyddion(file_path, gwyddion_path=None):
+    """
+    Launch Gwyddion with the given file already open.
+
+    Args:
+        file_path: Path to the TIFF (or other Gwyddion-readable) file.
+        gwyddion_path: Optional explicit path to the Gwyddion executable
+            or (on macOS) .app bundle. Auto-detected if not provided.
+
+    Returns:
+        (success, message) tuple.
+    """
+    if not os.path.isfile(file_path):
+        return False, f"File not found: {file_path}"
+
+    gwyddion_path = gwyddion_path or find_gwyddion_executable()
+    if not gwyddion_path:
+        return False, (
+            "Could not find Gwyddion. Install it or set the path manually "
+            "in the sidebar."
+        )
+
+    system = platform.system()
+    try:
+        if system == "Darwin" and gwyddion_path.endswith(".app"):
+            subprocess.Popen(["open", "-a", gwyddion_path, file_path])
+        else:
+            subprocess.Popen([gwyddion_path, file_path])
+        return True, f"Opened {os.path.basename(file_path)} in Gwyddion"
+    except OSError as e:
+        return False, f"Failed to launch Gwyddion: {e}"
