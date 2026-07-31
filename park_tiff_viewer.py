@@ -193,6 +193,22 @@ def build_gallery_rows(
     return rows
 
 
+def detect_image_select_click(row_key, count):
+    """
+    Returns the newly-clicked index for a `key=row_key` image_select
+    widget if it changed since the last time this was checked, else None.
+    Tracks "last seen index" itself in session_state, so callers don't
+    re-fire on every rerun — only on an actual fresh click.
+    """
+    prev_key = f"_{row_key}_prev"
+    clicked_idx = st.session_state.get(row_key)
+    prev_idx = st.session_state.get(prev_key, 0)
+    if clicked_idx is not None and clicked_idx != prev_idx and clicked_idx < count:
+        st.session_state[prev_key] = clicked_idx
+        return clicked_idx
+    return None
+
+
 def sync_gallery_clicks(gallery_rows, filtered_files):
     """
     Peek at each gallery row's image_select value *before* it's actually
@@ -205,15 +221,8 @@ def sync_gallery_clicks(gallery_rows, filtered_files):
     """
     for fk, entries in gallery_rows:
         row_key = f"gallery_row_{fk[0]}_{fk[1]}"
-        prev_key = f"_{row_key}_prev"
-        clicked_idx = st.session_state.get(row_key)
-        prev_idx = st.session_state.get(prev_key, 0)
-        if (
-            clicked_idx is not None
-            and clicked_idx != prev_idx
-            and clicked_idx < len(entries)
-        ):
-            st.session_state[prev_key] = clicked_idx
+        clicked_idx = detect_image_select_click(row_key, len(entries))
+        if clicked_idx is not None:
             _, clicked_file = entries[clicked_idx]
             select_file_from_gallery(clicked_file, filtered_files)
 
@@ -772,6 +781,7 @@ def main():
     # ============================================================
     with tab2:
         st.subheader("📊 All Channels for Selected Frame")
+        st.caption("Click a thumbnail to copy its file path to the clipboard.")
 
         # Get unique frames (experiment + frame number combinations)
         frames_info = get_frames_info(filtered_files)
@@ -780,7 +790,7 @@ def main():
             st.warning("No frames with valid metadata found.")
         else:
             # Frame selection
-            col_sel1, col_sel2, col_sel3 = st.columns([2, 1, 1])
+            col_sel1, col_sel2 = st.columns([2, 1])
 
             with col_sel1:
                 frame_options = [
@@ -808,11 +818,6 @@ def main():
                     key="dir_filter_all",
                 )
 
-            with col_sel3:
-                cols_per_row = st.selectbox(
-                    "Columns", options=[2, 3, 4], index=1, key="cols_all"
-                )
-
             # Get all channels for this frame
             dir_filter = None if direction_filter == "Both" else direction_filter
             frame_channels = get_all_channels_for_frame(
@@ -824,63 +829,64 @@ def main():
             else:
                 st.markdown(f"**Found {len(frame_channels)} channels**")
 
-                # Display all channels in grid
-                n_channels = len(frame_channels)
-                rows_needed = (n_channels + cols_per_row - 1) // cols_per_row
+                entries = []
+                for f in frame_channels:
+                    bg_method = get_bg_method_for_channel(f["channel"])
+                    data = cached_load_and_process(
+                        f["path"], bg_method, poly_degree, fourier_cutoff
+                    )
+                    if data is None:
+                        continue
 
-                for row in range(rows_needed):
-                    cols = st.columns(cols_per_row)
-                    for col_idx in range(cols_per_row):
-                        file_idx = row * cols_per_row + col_idx
-                        if file_idx < n_channels:
-                            f = frame_channels[file_idx]
-                            with cols[col_idx]:
-                                bg_method = get_bg_method_for_channel(f["channel"])
-                                data = cached_load_and_process(
-                                    f["path"], bg_method, poly_degree, fourier_cutoff
-                                )
-                                if data is not None:
-                                    # Check completeness
-                                    is_complete, pct = cached_check_file_complete(
-                                        f["path"]
-                                    )
-                                    status = "✅" if is_complete else f"⚠️ {pct:.0f}%"
+                    is_complete, pct = cached_check_file_complete(f["path"])
+                    status = "✅" if is_complete else f"⚠️{pct:.0f}%"
 
-                                    # Choose colormap
-                                    if auto_colormap and f["channel"]:
-                                        cmap = get_colormap_for_channel(f["channel"])
-                                    else:
-                                        cmap = colormap
+                    cmap = (
+                        get_colormap_for_channel(f["channel"])
+                        if auto_colormap and f["channel"]
+                        else colormap
+                    )
+                    vmin, vmax = get_adjusted_display_range(data)
+                    arr = render_thumbnail_array(
+                        f["path"],
+                        bg_method,
+                        poly_degree,
+                        fourier_cutoff,
+                        cmap,
+                        float(vmin),
+                        float(vmax),
+                    )
+                    if arr is None:
+                        continue
 
-                                    # Get color scale limits
-                                    vmin, vmax = get_adjusted_display_range(data)
+                    stats = get_image_stats(data)
+                    caption = f"{f['channel']} · {f['direction']} {status}"
+                    if bg_method != "None":
+                        caption += f" [{bg_method}]"
+                    caption += f" · {stats['min']:.2g}–{stats['max']:.2g}"
 
-                                    # Create figure
-                                    fig, ax = plt.subplots(figsize=(4, 4))
-                                    im = ax.imshow(
-                                        data,
-                                        cmap=cmap,
-                                        vmin=vmin,
-                                        vmax=vmax,
-                                        origin="upper",
-                                    )
-                                    plt.colorbar(im, ax=ax, shrink=0.8)
+                    entries.append((f, arr, caption))
 
-                                    # Title with BG indicator
-                                    title = f"{f['channel']}\n{f['direction']} {status}"
-                                    if bg_method != "None":
-                                        title += f"\n[{bg_method}]"
-                                    ax.set_title(title, fontsize=9)
-                                    ax.axis("off")
-                                    plt.tight_layout()
+                if entries:
+                    row_key = "all_channels_select"
+                    clicked_idx = detect_image_select_click(row_key, len(entries))
+                    if clicked_idx is not None:
+                        clicked_file = entries[clicked_idx][0]
+                        ok, msg = copy_to_clipboard(clicked_file["path"])
+                        name = os.path.basename(clicked_file["path"])
+                        st.toast(f"📋 Copied path — {name}" if ok else f"⚠️ {msg}")
 
-                                    st.pyplot(fig)
-                                    plt.close(fig)
-
-                                    stats = get_image_stats(data)
-                                    st.caption(
-                                        f"Range: {stats['min']:.2g} - {stats['max']:.2g}"
-                                    )
+                    default_idx = min(
+                        st.session_state.get(f"_{row_key}_prev", 0), len(entries) - 1
+                    )
+                    image_select(
+                        "",
+                        images=[arr for _, arr, _ in entries],
+                        captions=[caption for _, _, caption in entries],
+                        index=default_idx,
+                        return_value="index",
+                        key=row_key,
+                    )
 
     # ============================================================
     # TAB 3: Export to PowerPoint
@@ -1022,7 +1028,6 @@ def main():
             dir_filter = None if export_direction == "Both" else export_direction
 
             # Create temporary file for download
-            import os
             import tempfile
             from pathlib import Path
 
