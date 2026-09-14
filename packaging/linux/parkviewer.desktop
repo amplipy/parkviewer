@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ParkViewer
+GenericName=Park AFM TIFF Viewer
+Comment=Browse and preview Park AFM TIFF data files
+Exec=ParkViewer
+Icon=PARKVIEWER_ICON_PATH
+Terminal=false
+Categories=Science;
+StartupWMClass=ParkViewer

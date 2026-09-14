@@ -1,0 +1,28 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.spec.bak
+
+# PyInstaller
+*.manifest
+
+# --- App packaging artifacts ---
+packaging/assets/*.icns
+packaging/assets/*.ico
+packaging/assets/icon_*.png
+
+# --- OS cruft ---
+.DS_Store
+Thumbs.db
+
+# --- Editors ---
+.vscode/
+.idea/
+
+# --- Marimo session cache ---
+__marimo__/

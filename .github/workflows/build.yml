@@ -1,0 +1,117 @@
+name: Build desktop app
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14 # Apple Silicon
+            asset: ParkViewer-macos.zip
+          - os: ubuntu-22.04 # older glibc => widest Linux compatibility
+            asset: ParkViewer-linux.tar.gz
+          - os: windows-2022
+            asset: ParkViewer-windows.zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # Qt WebEngine system libs for the Linux smoke test (the wheels bundle
+      # Qt itself; these are just the XCB/GL pieces it dlopens).
+      - name: Install Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libxcb-cursor0 libdbus-1-3
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: ./scripts/build_macos.sh
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: ./scripts/build_linux.sh
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: scripts\build_windows.bat
+
+      - name: Smoke test — serve-only health check (macOS/Linux)
+        if: runner.os != 'Windows'
+        working-directory: dist/ParkViewer
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then BIN=./ParkViewer; else BIN=./ParkViewer; fi
+          PARKVIEWER_SERVE_ONLY=1 "$BIN" > serve.log 2>&1 &
+          PID=$!
+          CODE=""
+          for i in $(seq 1 60); do
+            PORT=$(grep -oE 'http://127\.0\.0\.1:[0-9]+' serve.log | head -1 | grep -oE '[0-9]+$' || true)
+            if [ -n "$PORT" ]; then
+              CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/_stcore/health" || true)
+              [ "$CODE" = "200" ] && break
+            fi
+            sleep 2
+          done
+          kill $PID 2>/dev/null || true
+          echo "health=$CODE"
+          [ "$CODE" = "200" ]
+
+      - name: Smoke test — artifact exists (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path dist/ParkViewer/ParkViewer.exe)) { throw "ParkViewer.exe missing" }
+          Get-ChildItem dist | Format-Table
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ParkViewer-${{ matrix.os }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Attach builds to rolling release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Refresh rolling "desktop" prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete desktop --yes --cleanup-tag || true
+          gh release create desktop dist/* \
+            --prerelease \
+            --title "ParkViewer desktop builds (auto)" \
+            --notes "Automated cross-platform builds from main.
+
+          - **ParkViewer-macos.zip** — macOS (Apple Silicon). Unzip, run ParkViewer.app (right-click → Open the first time).
+          - **ParkViewer-windows.zip** — Windows 10/11 x64. Unzip, run ParkViewer\\\\ParkViewer.exe.
+          - **ParkViewer-linux.tar.gz** — Linux x86_64 (glibc 2.35+). Extract, run ./ParkViewer/ParkViewer."
