@@ -1,0 +1,28 @@
+[package]
+name = "parkviewer"
+version = "2.0.0"
+edition = "2021"
+description = "Standalone native desktop viewer for Park AFM TIFF data (Rust/egui port of the Python Parkviewer)"
+license = "MIT"
+
+[dependencies]
+eframe = "0.36"
+image = { version = "0.25", default-features = false, features = ["tiff"] }
+rfd = "0.17"
+rayon = "1.12"
+rustfft = "6.4"
+half = "2.7"
+dirs = "7"
+arboard = "3.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.release.package."*"]
+opt-level = 3

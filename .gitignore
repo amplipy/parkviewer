@@ -26,3 +26,5 @@ Thumbs.db
 
 # --- Marimo session cache ---
 __marimo__/
+# --- Rust build artifacts ---
+rust/target/

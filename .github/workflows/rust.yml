@@ -1,0 +1,116 @@
+name: Rust build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            asset: parkviewer-macos-arm64.tar.gz
+          - os: macos-13
+            asset: parkviewer-macos-x64.tar.gz
+          - os: ubuntu-22.04
+            asset: parkviewer-linux-x64.tar.gz
+          - os: windows-2022
+            asset: parkviewer-windows-x64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # Linux: egui needs runtime GL/Window libs for the headless link check
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev \
+            libxcb-cursor-dev libxcb-xfixes0-dev libgl1-mesa-dev libasound2-dev
+
+      - name: Tests (macOS/Linux)
+        if: runner.os != 'Windows'
+        working-directory: rust
+        run: cargo test --release
+
+      - name: Tests (Windows)
+        if: runner.os == 'Windows'
+        working-directory: rust
+        shell: pwsh
+        run: cargo test --release
+
+      - name: Build release (unix)
+        if: runner.os != 'Windows'
+        working-directory: rust
+        run: |
+          cargo build --release
+          BIN=target/release/parkviewer
+          NAME=parkviewer
+          [ "$RUNNER_OS" = "Windows" ] && BIN=target/release/parkviewer.exe
+          strip "$BIN" || true
+          mkdir -p stage
+          cp "$BIN" stage/
+          cp packaging/linux/parkviewer.desktop stage/ 2>/dev/null || true
+          tar -czf "../${{ matrix.asset }}" -C stage .
+
+      - name: Build release (Windows)
+        if: runner.os == 'Windows'
+        working-directory: rust
+        shell: pwsh
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item target/release/parkviewer.exe stage/
+          Compress-Archive -Path stage/parkviewer.exe -DestinationPath ../${{ matrix.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ../${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Refresh rolling "native" prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete native -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create native -R "$GITHUB_REPOSITORY" dist/* \
+            --prerelease \
+            --title "ParkViewer native (Rust) builds (auto)" \
+            --notes "Single-binary native builds (Rust/egui) — no Python, no webview runtime.
+
+          - parkviewer-macos-arm64.tar.gz — Apple Silicon
+          - parkviewer-macos-x64.tar.gz — Intel Mac
+          - parkviewer-linux-x64.tar.gz — Linux x86_64
+          - parkviewer-windows-x64.zip — Windows x64
+
+          Extract and run the single \`parkviewer\` binary."
