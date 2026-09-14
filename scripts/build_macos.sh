@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 python3 -m venv .venv
 ./.venv/bin/pip install --upgrade pip
 ./.venv/bin/pip install -r requirements.txt
-python3 scripts/make_icon.py
+./.venv/bin/python scripts/make_icon.py
 ./.venv/bin/pyinstaller --clean --noconfirm packaging/pyinstaller.spec
 
 # Ship the .app (PyInstaller BUNDLE output) zipped with mac metadata preserved.
