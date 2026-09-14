@@ -106,8 +106,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete desktop --yes --cleanup-tag || true
-          gh release create desktop dist/* \
+          gh release delete desktop -R "$GITHUB_REPOSITORY" --yes --cleanup-tag || true
+          gh release create desktop -R "$GITHUB_REPOSITORY" dist/* \
             --prerelease \
             --title "ParkViewer desktop builds (auto)" \
             --notes "Automated cross-platform builds from main.
