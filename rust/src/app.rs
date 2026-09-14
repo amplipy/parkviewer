@@ -103,8 +103,9 @@ pub fn run_native() -> Result<()> {
 }
 
 fn load_icon() -> egui::IconData {
-    let png = include_bytes!("../../packaging/assets/icon_256.png");
-    let img = image::load_from_memory(png).expect("bundled icon");
+    let icon_path = std::path::PathBuf::from(env!("PARKVIEWER_ICON_PATH"));
+    let img = image::open(&icon_path)
+        .unwrap_or_else(|e| panic!("bundled icon missing at {}: {e}", icon_path.display()));
     let rgba = img.to_rgba8();
     egui::IconData {
         width: rgba.width(),
