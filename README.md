@@ -1,64 +1,77 @@
 # Parkviewer
 
-Standalone desktop app for browsing and previewing Park AFM TIFF data files
-(data summary generator for Park AFM data).
+Standalone **native** desktop app for browsing and previewing Park AFM TIFF
+data files. Single self-contained binary per OS — no Python, no runtime,
+no webview. Written in Rust (egui).
 
-Built on the original Streamlit viewer (`park_tiff_viewer.py` +
-`park_tiff_core.py`), packaged with PyInstaller so it runs as a normal
-desktop app on **macOS, Windows, and Linux** — no Python install required.
+## Download
 
-## Download prebuilt apps
+CI builds binaries for four platforms on every push to `main` and attaches
+them to the rolling [`native` release](../../releases/tag/native):
 
-CI builds installers for all three platforms on every push to `main`:
+| File | Platform |
+|---|---|
+| `parkviewer-macos-arm64.tar.gz` | Apple Silicon |
+| `parkviewer-macos-x64.tar.gz` | Intel Mac |
+| `parkviewer-linux-x64.tar.gz` | Linux x86_64 |
+| `parkviewer-windows-x64.zip` | Windows x64 |
 
-1. Open the repo's **Actions → Build desktop app** page, or the rolling
-   [releases page](../../releases) (`desktop` prerelease).
-2. Grab the artifact for your OS:
-   - `ParkViewer-macos.zip` → unzip → `ParkViewer.app` (first launch:
-     right-click → **Open** to bypass Gatekeeper)
-   - `ParkViewer-windows.zip` → unzip → run `ParkViewer\ParkViewer.exe`
-   - `ParkViewer-linux.tar.gz` → `tar xzf` → run `./ParkViewer/ParkViewer`
+Extract and run the single `parkviewer` binary. First launch on macOS:
+right-click → **Open** (binary is unsigned).
 
-## Run from source
+## Build from source
 
 ```bash
-python -m venv .venv
-./.venv/bin/pip install -r requirements.txt
-streamlit run park_tiff_viewer.py        # classic browser mode
-./.venv/bin/python app_entry.py          # desktop-window mode
+cd rust
+cargo build --release
+# binary: rust/target/release/parkviewer
 ```
 
-## How the desktop wrapper works
+Requires only a Rust toolchain (no system libs — egui renders via GPU).
 
-Streamlit serves a web page only, so `app_entry.py`:
+## Features
 
-1. spawns the same executable as a child process running the Streamlit
-   server on `127.0.0.1` (Streamlit must own the main thread — it installs
-   signal handlers);
-2. waits for the `/_stcore/health` endpoint;
-3. opens a native window via pywebview (WebKit on macOS, WebView2 on
-   Windows, Qt WebEngine on Linux) and falls back to the system browser
-   automatically if no native backend is available;
-4. terminates the server child when the window closes.
+- Folder scan of Park AFM TIFFs (`.tif`/`.tiff`), parallel metadata parse
+- Custom Park TIFF tags: channel (UTF-16-LE in tag 50435), z-scale,
+  scan rate, scan size, software, datetime
+- Filename grammar: experiment / channel / direction / frame number
+- Filters: channels, directions, experiments; hide-incomplete detection
+  (interrupted-scan truncation)
+- Three views: Single File, All Channels per frame, Gallery
+- Colormaps per channel (viridis/plasma/magma/terrain/hsv/twilight/RdBu_r…,
+  matplotlib-parity LUTs), auto or manual selection
+- Color scale: percentile (auto) or manual center/scale
+- Background subtraction: plane, line mean/median/poly, 2D polynomial,
+  Fourier high-pass — all NaN-aware, numpy-parity numerics
+- 16-bit TIFF precision preserved end-to-end
+- "Open in Gwyddion" handoff (auto-locates Gwyddion per OS) and
+  copy-path-to-clipboard
+- Folder + Gwyddion paths persisted between runs
 
-`PARKVIEWER_SERVE_ONLY=1 <binary>` runs just the server (used by the CI
-smoke test).
+## Layout
 
-## Building yourself
+```
+rust/
+  src/core.rs        folder scan, filename grammar, completeness, filters
+  src/metadata.rs    raw TIFF tag parser (Park tag 50435 + 305/306)
+  src/backgrounds.rs the 7 background-subtraction methods
+  src/colormaps.rs   deterministic colormap LUTs
+  src/app.rs         egui UI
+  tests/pipeline.rs  end-to-end tests vs synthetic Park TIFF corpus
+.github/workflows/rust.yml   4-OS build matrix -> rolling 'native' release
+scripts/make_icon.py         deterministic icon generator (PIL)
+```
 
-| OS | Command |
-|---|---|
-| macOS | `./scripts/build_macos.sh` → `dist/ParkViewer.app` |
-| Windows | `scripts\build_windows.bat` → `dist\ParkViewer\` |
-| Linux | `./scripts/build_linux.sh` → `dist/ParkViewer/` |
+## Tests
 
-All three share `packaging/pyinstaller.spec`. Icons come from
-`scripts/make_icon.py` (PIL-drawn, deterministic).
+```bash
+cd rust && cargo test
+```
 
-## Notes
+## History
 
-- "Open with Gwyddion" locates Gwyddion automatically on each OS
-  (`/Applications/Gwyddion.app`, `C:\Program Files*\Gwyddion\bin\gwyddion.exe`,
-  `/usr/bin/gwyddion`).
-- The default data folder preset was written for macOS (Box path); on other
-  OSes just type your data folder in the sidebar.
+The original version of this app was a Streamlit script
+(`park_tiff_viewer.py` + `park_tiff_core.py`, by NanosparQ Training).
+It was ported to Rust so the app ships as one self-contained binary per
+platform. The Python core module's behavior is preserved function-for-
+function in `rust/src/`; the Streamlit viewer remains in the repo history.
